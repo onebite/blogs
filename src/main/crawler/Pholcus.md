@@ -52,3 +52,200 @@ pholcus有两个下载器，surf和phantomjs(phantomjs已停止更新)，用起�
 
 最后采用webdriver，自己新增了个selenium downloader,效果挺好，爆破力极强，[源码传送](https://github.com/onebite/pholcus/blob/master/app/downloader/surfer/sel.go).
 贴一下，chromedriver.exe支持的[webdriver命令](https://chromium.googlesource.com/chromium/src/+/master/docs/chromedriver_status.md)
+![chrome webdriver](https://github.com/onebite/blogs/blob/master/src/assets/chromesupport.png)
+##讨论
+pholcus源码有个地方，就是它的请求队列矩阵，源代码传送[matrix.go](https://github.com/henrylee2cn/pholcus/blob/master/app/scheduler/matrix.go)。
+它的出队pull和入队push，是用同一把锁，然后里面有一段sleep，如下
+`golang
+
+    // 添加请求到队列，并发安全
+    func (self *Matrix) Push(req *request.Request) {
+    	// 禁止并发，降低请求积存量
+    	self.Lock()
+    	defer self.Unlock()
+    
+    	if sdl.checkStatus(status.STOP) {
+    		return
+    	}
+    
+    	// 达到请求上限，停止该规则运行
+    	if self.maxPage >= 0 {
+    		return
+    	}
+    
+    	// 暂停状态时等待，降低请求积存量
+    	waited := false
+    	for sdl.checkStatus(status.PAUSE) {
+    		waited = true
+    		time.Sleep(time.Second)
+    	}
+    	if waited && sdl.checkStatus(status.STOP) {
+    		return
+    	}
+    
+    	// 资源使用过多时等待，降低请求积存量
+    	waited = false
+    	for atomic.LoadInt32(&self.resCount) > sdl.avgRes() {
+    		waited = true
+    		time.Sleep(100 * time.Millisecond)
+    	}
+    	if waited && sdl.checkStatus(status.STOP) {
+    		return
+    	}
+    
+    	// 不可重复下载的req
+    	if !req.IsReloadable() {
+    		// 已存在成功记录时退出
+    		if self.hasHistory(req.Unique()) {
+    			return
+    		}
+    		// 添加到临时记录
+    		self.insertTempHistory(req.Unique())
+    	}
+    
+    	var priority = req.GetPriority()
+    
+    	// 初始化该蜘蛛下该优先级队列
+    	if _, found := self.reqs[priority]; !found {
+    		self.priorities = append(self.priorities, priority)
+    		sort.Ints(self.priorities) // 从小到大排序
+    		self.reqs[priority] = []*request.Request{}
+    	}
+    
+    	// 添加请求到队列
+    	self.reqs[priority] = append(self.reqs[priority], req)
+    
+    	// 大致限制加入队列的请求量，并发情况下应该会比maxPage多
+    	atomic.AddInt64(&self.maxPage, 1)
+    }
+    
+    // 从队列取出请求，不存在时返回nil，并发安全
+    func (self *Matrix) Pull() (req *request.Request) {
+    	self.Lock()
+    	defer self.Unlock()
+    	if !sdl.checkStatus(status.RUN) {
+    		return
+    	}
+    	// 按优先级从高到低取出请求
+    	for i := len(self.reqs) - 1; i >= 0; i-- {
+    		idx := self.priorities[i]
+    		if len(self.reqs[idx]) > 0 {
+    			req = self.reqs[idx][0]
+    			self.reqs[idx] = self.reqs[idx][1:]
+    			if sdl.useProxy {
+    				req.SetProxy(sdl.proxy.GetOne(req.GetUrl()))
+    			} else {
+    				req.SetProxy("")
+    			}
+    			return
+    		}
+    	}
+    	return
+    }
+
+`
+这里，应该是想同时控制出队速度，并发数可以控制。在我运行的过程中观察，中间请求有时会中断几分钟或者几十分钟，甚至运行几天后，会中断几个小时。
+应该是push线程一直拿到锁的原因。修改，参考java线程加了个ready队列，如下
+`golang
+
+    func (self *Matrix) PushAndChoose(req *request.Request) (*request.Request){
+    	// 禁止并发，降低请求积存量
+    	self.Lock()
+    	defer self.Unlock()
+    
+    	waited := false
+    
+    	if sdl.checkStatus(status.STOP) {
+    		return nil
+    	}
+    
+    	for sdl.checkStatus(status.PAUSE) {
+    		waited = true
+    		time.Sleep(time.Second)
+    	}
+    
+    	// 达到请求上限，停止该规则运行
+    	if self.maxPage >= 0 {
+    		return nil
+    	}
+    
+    	if waited && sdl.checkStatus(status.STOP) {
+    		return nil
+    	}
+    
+    	// 不可重复下载的req
+    	if !req.IsReloadable() {
+    		// 已存在成功记录时退出
+    		if self.hasHistory(req.Unique()) {
+    			return nil
+    		}
+    		// 添加到临时记录
+    		self.insertTempHistory(req.Unique())
+    	}
+    
+    	var priority = req.GetPriority()
+    
+    	// 初始化该蜘蛛下该优先级队列
+    	if _, found := self.reqs[priority]; !found {
+    		self.priorities = append(self.priorities, priority)
+    		sort.Ints(self.priorities) // 从小到大排序
+    		self.reqs[priority] = []*request.Request{}
+    	}
+    
+    	// 添加请求到队列
+    	self.reqs[priority] = append(self.reqs[priority], req)
+    
+    	// 按优先级从高到低取出到就绪队列
+    	for i := len(self.reqs) - 1; i >= 0; i-- {
+    		idx := self.priorities[i]
+    		if len(self.reqs[idx]) > 0 {
+    			ready := self.reqs[idx][0]
+    			self.reqs[idx] = self.reqs[idx][1:]
+    
+    			return ready
+    		}
+    	}
+    
+    	// 大致限制加入队列的请求量，并发情况下应该会比maxPage多
+    	atomic.AddInt64(&self.maxPage, 1)
+    	return nil
+    }
+    
+    func (self *Matrix) Push(req *request.Request) {
+    	//将sleep放到锁外，避免出现长时间等待
+    	// 资源使用过多时等待，降低请求积存量  这里控制最大协程的数量，控制入队速率，等待放在锁里面，同时控制出队速率
+    	for atomic.LoadInt32(&self.resCount) > sdl.avgRes() {
+    		time.Sleep(100 * time.Millisecond)
+    	}
+    
+    	if sdl.checkStatus(status.STOP) {
+    		return
+    	}
+    
+    	ready := self.PushAndChoose(req)
+    
+    	if ready == nil {
+    		return
+    	}
+    
+    	self.readys <- ready
+    }
+    func (self *Matrix) Pull() (req *request.Request) {
+    	if !sdl.checkStatus(status.RUN) {
+    		return
+    	}
+    
+    	for req = range self.readys {
+    		break
+    	}
+    
+    
+    	if sdl.useProxy {
+    		req.SetProxy(sdl.proxy.GetOne(req.GetUrl()))
+    	} else {
+    		req.SetProxy("")
+    	}
+    
+    	return
+    }
+`
